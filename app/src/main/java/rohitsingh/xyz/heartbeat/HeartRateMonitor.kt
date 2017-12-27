@@ -6,6 +6,7 @@ import android.support.v7.app.AppCompatActivity
 import android.os.Bundle
 import android.provider.ContactsContract
 import android.util.Log
+import android.widget.TextView
 import android.widget.Toast
 import com.jjoe64.graphview.GraphView
 import com.jjoe64.graphview.GridLabelRenderer
@@ -19,11 +20,13 @@ const val CAMERA_REQUEST_CODE = 1021 // literally no reason for this choice
 class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
 
 
+
     private val loggingTag: String = "HeartRateMonitor"
 
     private lateinit var provider: PulseProvider
 
-    private val graph: GraphView by lazy { findViewById<GraphView>(R.id.graph) }
+    private val graph by lazy { findViewById<GraphView>(R.id.graph) }
+    private val pulseView by lazy {findViewById<TextView>(R.id.pulse)}
     private val mmHg = LineGraphSeries<DataPoint>()
     private var movingAverage = 0f
     private val SMOOTHING_FACTOR = 0.7f;
@@ -32,6 +35,16 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
         setContentView(R.layout.activity_heart_rate_monitor)
         setupPermissions()
         setupGraphing()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        provider.pause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        provider.restart()
     }
 
     private fun setupGraphing() {
@@ -46,6 +59,10 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
         mmHg.color = Color.RED
         mmHg.thickness = 30
         provider.addHeartbeatListener(this)
+    }
+
+    override fun onNewPulse(pulse: Float) {
+        pulseView.text = pulse.toInt().toString()
     }
 
     override fun onHeartbeat(timestamp: Long, brightness: Float) {

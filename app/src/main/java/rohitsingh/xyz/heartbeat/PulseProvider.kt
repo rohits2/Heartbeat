@@ -10,6 +10,7 @@ import android.util.Log
 import android.view.Surface
 import android.widget.Toast
 import java.lang.Math.abs
+import java.lang.Math.sqrt
 import java.nio.ByteBuffer
 
 /**
@@ -19,11 +20,13 @@ const val MAX_IMAGES = 4 //The maximum length of the ImageReader queue.
 const val HISTORY_BUFFER_SIZE = 128 //The size of the buffers storing brightness and timestamp. Must be a power of two for the FFT algorithm.
 const val FRAME_WIDTH = 480
 const val FRAME_HEIGHT = 240
+
 class PulseProvider(private val context: Context) {
     // Globals for camera capture
     private lateinit var camera: CameraDevice
     private val reader = ImageReader.newInstance(FRAME_WIDTH, FRAME_HEIGHT, ImageFormat.YUV_420_888, MAX_IMAGES)
     private val handler = Handler()
+    private var holdsOpenCamera = false
 
     // Constant for logging
     private val loggingTag: String = "PulseProvider"
@@ -40,9 +43,10 @@ class PulseProvider(private val context: Context) {
 
     // Signal extraction state
     private val fourier = FFT(HISTORY_BUFFER_SIZE)
-
+    val zeros = DoubleArray(HISTORY_BUFFER_SIZE)
 
     init {
+        holdsOpenCamera = true
         openCamera(reader.surface)
         reader.setOnImageAvailableListener({ _ -> getCameraDelta() }, null)
     }
@@ -55,6 +59,20 @@ class PulseProvider(private val context: Context) {
 
     fun removeHeartbeatListener(listener: HeartbeatListener): Boolean {
         return beatListeners.remove(listener)
+    }
+
+    fun pause(){
+        if(holdsOpenCamera) {
+            holdsOpenCamera = false
+            camera.close()
+        }
+    }
+
+    fun restart(){
+        if(!holdsOpenCamera) {
+            holdsOpenCamera = true
+            openCamera(reader.surface)
+        }
     }
 
     private fun openCamera(readerSurface: Surface) {
@@ -70,7 +88,7 @@ class PulseProvider(private val context: Context) {
             }
 
             override fun onOpened(device: CameraDevice?) {
-                camera = device ?: throw CameraAccessException(0)
+                camera = device ?: throw CameraAccessException(CameraAccessException.CAMERA_ERROR)
                 val captureBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                 captureBuilder.addTarget(readerSurface)
                 captureBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
@@ -107,7 +125,10 @@ class PulseProvider(private val context: Context) {
                 sb.append(", ")
             }
             Log.d(loggingTag, "RBuf: " + sb.toString())
-            lastPulse = computeFrequency()
+            currentPulse = computeFrequency()
+            for (listener in beatListeners) {
+                listener.onNewPulse(currentPulse)
+            }
         }
         append(diff, image.timestamp)
         for (listener in beatListeners) {
@@ -123,8 +144,8 @@ class PulseProvider(private val context: Context) {
         bufferIndex %= HISTORY_BUFFER_SIZE
     }
 
-    private fun computeMeanValue(array: ShortArray): Float{
-        return array.map { it.toLong() }.sum()/array.size.toFloat()
+    private fun computeMeanValue(array: ShortArray): Float {
+        return array.map { it.toLong() }.sum() / array.size.toFloat()
     }
 
     private fun computeMeanDifference(array1: ShortArray, array2: ShortArray): Float {
@@ -137,8 +158,31 @@ class PulseProvider(private val context: Context) {
         return totalDiff / array1.size.toFloat()
     }
 
-    private fun computeMeanFrequency(): Float {
-        return 0f
+    private fun computeFrequency(): Float {
+        val brightnessFFT = DoubleArray(HISTORY_BUFFER_SIZE)
+        (0 until HISTORY_BUFFER_SIZE).map { brightnessFFT[it] = brightnessHistory[it].toDouble() }
+        fourier.fft(brightnessFFT, zeros)
+        (0 until HISTORY_BUFFER_SIZE).map { brightnessFFT[it] = 2.0/ HISTORY_BUFFER_SIZE * sqrt(brightnessFFT[it] * brightnessFFT[it] + zeros[it] * zeros[it]) }
+        zeros.map { 0 }
+        var max = 0.0
+        var argmax = 0
+        for (i in 1 until HISTORY_BUFFER_SIZE / 2) {
+            if (brightnessFFT[i] > max) {
+                max = brightnessFFT[i]
+                argmax = i
+            }
+        }
+        val sb = StringBuilder()
+        for (i in brightnessFFT) {
+            sb.append(i.toString())
+            sb.append(", ")
+        }
+        Log.d(loggingTag, "FFTBuf: " + sb.toString())
+        val meanInterval = averageDistance(timestampHistory) / 1e9;
+        Log.d(loggingTag, "Mean interval computed as $meanInterval")
+        val bpm = argmax * HISTORY_BUFFER_SIZE * meanInterval.toFloat()
+        Log.d(loggingTag, "FFT-derived freq $bpm bpm")
+        return bpm
     }
 
     private fun convertByteBufferToShortArray(buffer: ByteBuffer): ShortArray {
@@ -163,5 +207,6 @@ class PulseProvider(private val context: Context) {
 
     interface HeartbeatListener {
         fun onHeartbeat(timestamp: Long, brightness: Float)
+        fun onNewPulse(pulse: Float)
     }
 }

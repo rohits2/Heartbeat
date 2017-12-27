@@ -1,5 +1,7 @@
 package rohitsingh.xyz.heartbeat
 
+import java.lang.Math.abs
+
 /**
  * Created by rohit on 12/26/17.
  */
@@ -24,4 +26,8 @@ fun movingAverage(data: FloatArray, inertia: Float): FloatArray{
     var averagedArray = data.clone()
     averagedArray.reduce({prev: Float, new: Float->weightedAverage(prev, new, inertia)})
     return averagedArray
+}
+
+fun averageDistance(data: LongArray): Double{
+    return (0 until data.size-1).map { abs(data[it+1]-data[it]) }.average()
 }
