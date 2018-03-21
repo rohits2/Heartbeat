@@ -5,6 +5,8 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.support.v7.app.AppCompatActivity
 import android.os.Bundle
+import android.view.View
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import com.jjoe64.graphview.GraphView
@@ -23,6 +25,7 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
     private val graph by lazy { findViewById<GraphView>(R.id.graph) }
     private val pulseView by lazy {findViewById<TextView>(R.id.pulse)}
     private val pulseError by lazy {findViewById<TextView>(R.id.pulseError)}
+    private val progressCircle by lazy {findViewById<ProgressBar>(R.id.progressBar)}
     private val mmHg = LineGraphSeries<DataPoint>()
     private var movingAverage = 0f
 
@@ -47,7 +50,7 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
         graph.addSeries(mmHg)
         graph.viewport.isXAxisBoundsManual = true
         graph.viewport.setMinX(0.0)
-        graph.viewport.setMaxX(5.0)
+        graph.viewport.setMaxX(3.0)
         graph.viewport.isScrollable = false
         graph.gridLabelRenderer.gridStyle = GridLabelRenderer.GridStyle.NONE
         graph.gridLabelRenderer.isVerticalLabelsVisible = false
@@ -63,6 +66,10 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
     override fun onNewPulse(pulse: Float) {
         pulseView.text = pulse.toInt().toString()
         pulseError.text = "±${provider.pulseError.toInt()}"
+        if (provider.pulseError < 5){
+            provider.pause()
+            progressCircle.visibility = View.INVISIBLE
+        }
     }
 
     override fun onHeartbeat(timestamp: Float, brightness: Float) {
