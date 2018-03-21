@@ -12,6 +12,9 @@ import android.widget.Toast
 import org.nield.kotlinstatistics.simpleRegression
 import org.nield.kotlinstatistics.standardDeviation
 import java.nio.ByteBuffer
+import com.paramsen.noise.Noise
+import java.lang.Math.*
+
 
 /**
  * PulseProvider connects to the camera and tries to measure the pulse of skin against the camera.
@@ -30,6 +33,11 @@ const val FRAME_HEIGHT = 240
 const val TRENDLINE_INERTIA = 0.99f
 const val LOW_PASS_INERTIA = 0.7f
 const val ESTIMATED_MAGNITUDE = 70f //This is used to make the moving-average adjuster converge quickly.
+
+const val HZ = 1 / 60f   //This converts from hertz to the timestamp units (seconds, in this case)
+const val LOW_CUTOFF_FREQ = 30 * HZ
+const val HIGH_CUTOFF_FREQ = 240 * HZ
+const val SAMPLE_SIZE_REQUIRED = 8
 
 class PulseProvider(private val context: Context) {
     // Globals for camera capture
@@ -63,7 +71,7 @@ class PulseProvider(private val context: Context) {
     }
 
     val pulse get() = currentPulse
-    val pulseError get() = pulses.standardDeviation()
+    val pulseError get() = pulses.standardDeviation()/sqrt(pulses.size.toDouble())
 
     fun addHeartbeatListener(listener: HeartbeatListener) {
         beatListeners.add(listener)
@@ -71,6 +79,14 @@ class PulseProvider(private val context: Context) {
 
     fun removeHeartbeatListener(listener: HeartbeatListener): Boolean {
         return beatListeners.remove(listener)
+    }
+
+    fun end(){
+        if (holdsOpenCamera) {
+            holdsOpenCamera = false
+            camera.close()
+        }
+        pulses.clear()
     }
 
     fun pause() {
@@ -104,6 +120,7 @@ class PulseProvider(private val context: Context) {
                 val captureBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                 captureBuilder.addTarget(readerSurface)
                 captureBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
+                captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
 
                 camera.createCaptureSession(listOf(readerSurface), CameraSessionCallback(captureBuilder.build()), handler)
                 Log.d(loggingTag, "Acquired camera!")
@@ -148,12 +165,15 @@ class PulseProvider(private val context: Context) {
     }
 
     private fun handlePulse() {
-        printArray("BrightnessHistory", brightnessHistory)
-        printArray("TimestampHistory", timestampHistory)
+        //printArray("BrightnessHistory", brightnessHistory)
+        //printArray("TimestampHistory", timestampHistory)
         pulses.add(computeFrequency())
-        currentPulse = pulses.average().toFloat()
-        for (listener in beatListeners) {
-            listener.onNewPulse(currentPulse)
+        if (pulses.size > SAMPLE_SIZE_REQUIRED) {
+            pulses.removeAt(0)
+            currentPulse = pulses.average().toFloat()
+            for (listener in beatListeners) {
+                listener.onNewPulse(currentPulse)
+            }
         }
     }
 
@@ -167,25 +187,28 @@ class PulseProvider(private val context: Context) {
     }
 
     private fun computeFrequency(): Float {
-        val r = (0 until HISTORY_BUFFER_SIZE).map { timestampHistory[it] to brightnessHistory[it] }.simpleRegression()
-        Log.d(loggingTag, "Regression complete.  Parameters b=${r.intercept}, m=${r.slope}")
-        val meanInterval = timestampHistory.averageGap()
-        val totalMinInSegment = meanInterval * HISTORY_BUFFER_SIZE / 60
-        Log.d(loggingTag, "Mean interval computed as $meanInterval s for total history length of $totalMinInSegment min")
-
-        var bpPeaks = (0 until brightnessHistory.size).map{
-              if(timestampHistory[it]*r.slope+r.intercept > brightnessHistory[it]){
-                  0
-              } else brightnessHistory[it]
+        val noise = Noise.real()
+                .optimized()
+                .init(HISTORY_BUFFER_SIZE, true) //input size == 4096, internal output array
+        val complexFft = noise.fft(brightnessHistory.getBackingArray())
+        val realFft = FloatArray(HISTORY_BUFFER_SIZE / 2)
+        for (i in 0 until HISTORY_BUFFER_SIZE / 2 - 1) {
+            realFft[i] = complexFft[2 * i] * complexFft[2 * i] + complexFft[2 * i + 1] * complexFft[2 * i + 1]
         }
-        brightnessHistory.localMaximaIndices().map { timestampHistory[it] }
-
-        val numIntersects = (0 until HISTORY_BUFFER_SIZE - 1).map {
-            if (doesIntersect(timestampHistory[it], brightnessHistory[it], timestampHistory[it + 1], brightnessHistory[it + 1], r.slope.toFloat(), r.intercept.toFloat())) 1 else 0
-        }.sum()
-        val bpm = numIntersects / 2 / totalMinInSegment
-        Log.d(loggingTag, "Trendline intersect freq $bpm bpm")
-        return bpm.toFloat()
+        val interval = timestampHistory.averageGap()
+        val freqRange = 1f / (2f * interval / 60f)
+        val lowCut: Int = floor(LOW_CUTOFF_FREQ * HISTORY_BUFFER_SIZE * interval).toInt()
+        val highCut: Int = ceil(HIGH_CUTOFF_FREQ * HISTORY_BUFFER_SIZE * interval).toInt()
+        var maxA = 0f
+        var maxF = 20f
+        for (i in lowCut until highCut) {
+            if (realFft[i] > maxA) {
+                maxA = realFft[i]
+                maxF = (freqRange * (i / (HISTORY_BUFFER_SIZE / 2f))).toFloat()
+            }
+        }
+        Log.d(loggingTag, "Freq peak at ${maxF} (${maxA})")
+        return maxF
     }
 
     private fun convertByteBufferToShortArray(buffer: ByteBuffer): ShortArray {
@@ -195,6 +218,15 @@ class PulseProvider(private val context: Context) {
     }
 
     private fun printArray(arrayName: String, array: RingFloatArray) {
+        val sb = StringBuilder()
+        for (i in array) {
+            sb.append(i.toString())
+            sb.append(", ")
+        }
+        Log.d(loggingTag, "$arrayName: " + sb.toString())
+    }
+
+    private fun printArray(arrayName: String, array: FloatArray) {
         val sb = StringBuilder()
         for (i in array) {
             sb.append(i.toString())

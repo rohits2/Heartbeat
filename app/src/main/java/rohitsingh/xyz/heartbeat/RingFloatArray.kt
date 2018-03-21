@@ -23,6 +23,10 @@ class RingFloatArray(val size: Int):Iterable<Float>{
         currentOffset++
         currentOffset %= size
     }
+    fun getBackingArray(): FloatArray{
+        return backingBuffer
+    }
+
     fun localMaximaIndices(): MutableList<Int> {
         val indices = MutableList(1, { 0 })
         (1 until this.size - 1).map {
