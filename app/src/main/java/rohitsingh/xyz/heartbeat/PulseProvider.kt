@@ -9,17 +9,27 @@ import android.os.Handler
 import android.util.Log
 import android.view.Surface
 import android.widget.Toast
-import java.lang.Math.abs
-import java.lang.Math.sqrt
+import org.nield.kotlinstatistics.simpleRegression
+import org.nield.kotlinstatistics.standardDeviation
 import java.nio.ByteBuffer
 
 /**
+ * PulseProvider connects to the camera and tries to measure the pulse of skin against the camera.
+ * It allows clients to register to receive a raw feed of the blood pressure proxy, as well as
+ * updates to the completed pulse.
+ * This uses the camera flash, which can cause LED burnout if it is left on for too long.  To fix this,
+ * the methods pause() and resume() are provided, which disconnect and reconnect the camera.
  * Created by rohit on 9/4/17.
  */
 const val MAX_IMAGES = 4 //The maximum length of the ImageReader queue.
-const val HISTORY_BUFFER_SIZE = 128 //The size of the buffers storing brightness and timestamp. Must be a power of two for the FFT algorithm.
+const val HISTORY_BUFFER_SIZE = 256 //The size of the buffers storing brightness and timestamp.
+const val EVENT_TRIGGER = 32 // The number of samples before a pulse update is triggered
 const val FRAME_WIDTH = 480
 const val FRAME_HEIGHT = 240
+
+const val TRENDLINE_INERTIA = 0.99f
+const val LOW_PASS_INERTIA = 0.7f
+const val ESTIMATED_MAGNITUDE = 70f //This is used to make the moving-average adjuster converge quickly.
 
 class PulseProvider(private val context: Context) {
     // Globals for camera capture
@@ -33,25 +43,27 @@ class PulseProvider(private val context: Context) {
 
     // Buffers and variables for raw data capture
     private val startTime by lazy { timestampHistory[0] }
-    private val brightnessHistory: FloatArray = FloatArray(HISTORY_BUFFER_SIZE)
-    private val timestampHistory: LongArray = LongArray(HISTORY_BUFFER_SIZE)
-    private var bufferIndex = 0
+    private val brightnessHistory = RingFloatArray(HISTORY_BUFFER_SIZE)
+    private val timestampHistory = RingFloatArray(HISTORY_BUFFER_SIZE)
 
     // Interface variables
+    private var eventCounter = 0
     private var currentPulse: Float = 0f
     private var beatListeners = ArrayList<HeartbeatListener>()
 
-    // Signal extraction state
-    private val fourier = FFT(HISTORY_BUFFER_SIZE)
-    val zeros = DoubleArray(HISTORY_BUFFER_SIZE)
+    // Variables for signal extraction
+    private var trendlineAvg = ESTIMATED_MAGNITUDE
+    private var lowPassAvg = 0f
+    private var pulses = ArrayList<Float>()
 
     init {
         holdsOpenCamera = true
         openCamera(reader.surface)
-        reader.setOnImageAvailableListener({ _ -> getCameraDelta() }, null)
+        reader.setOnImageAvailableListener({ getFrame() }, null)
     }
 
     val pulse get() = currentPulse
+    val pulseError get() = pulses.standardDeviation()
 
     fun addHeartbeatListener(listener: HeartbeatListener) {
         beatListeners.add(listener)
@@ -61,15 +73,15 @@ class PulseProvider(private val context: Context) {
         return beatListeners.remove(listener)
     }
 
-    fun pause(){
-        if(holdsOpenCamera) {
+    fun pause() {
+        if (holdsOpenCamera) {
             holdsOpenCamera = false
             camera.close()
         }
     }
 
-    fun restart(){
-        if(!holdsOpenCamera) {
+    fun resume() {
+        if (!holdsOpenCamera) {
             holdsOpenCamera = true
             openCamera(reader.surface)
         }
@@ -113,82 +125,86 @@ class PulseProvider(private val context: Context) {
         throw CameraNotFoundException("No camera could be found!")
     }
 
-    private fun getCameraDelta() {
+    private fun getFrame() {
+        eventCounter++;
         val image = reader.acquireLatestImage() ?: return
         val (redBuf, _, _) = image.planes
         val currentRedBuffer = convertByteBufferToShortArray(redBuf.buffer)
-        val diff = computeMeanValue(currentRedBuffer)
-        if (bufferIndex == 0) {
-            val sb = StringBuilder()
-            for (i in brightnessHistory) {
-                sb.append(i.toString())
-                sb.append(", ")
-            }
-            Log.d(loggingTag, "RBuf: " + sb.toString())
-            currentPulse = computeFrequency()
-            for (listener in beatListeners) {
-                listener.onNewPulse(currentPulse)
-            }
+        var brightness = computeMeanValue(currentRedBuffer)
+        if (eventCounter % EVENT_TRIGGER == 0) {
+            handlePulse()
         }
-        append(diff, image.timestamp)
+        trendlineAvg = weightedAverage(trendlineAvg, brightness, TRENDLINE_INERTIA)
+        brightness -= trendlineAvg
+        lowPassAvg = weightedAverage(lowPassAvg, brightness, LOW_PASS_INERTIA)
+        if (timestampHistory[0] == 0f) {
+            timestampHistory[0] = nsToS(image.timestamp)
+        }
+        append(lowPassAvg, nsToS(image.timestamp) - startTime)
         for (listener in beatListeners) {
-            listener.onHeartbeat(image.timestamp - startTime, diff) // Offset image timestamp by start time to get more reasonable numbers
+            listener.onHeartbeat(nsToS(image.timestamp) - startTime, brightness) // Offset image timestamp by start time to get more reasonable numbers
         }
         image.close()
     }
 
-    private fun append(brightness: Float, timestamp: Long) {
-        brightnessHistory[bufferIndex] = brightness
-        timestampHistory[bufferIndex] = timestamp
-        bufferIndex += 1
-        bufferIndex %= HISTORY_BUFFER_SIZE
+    private fun handlePulse() {
+        printArray("BrightnessHistory", brightnessHistory)
+        printArray("TimestampHistory", timestampHistory)
+        pulses.add(computeFrequency())
+        currentPulse = pulses.average().toFloat()
+        for (listener in beatListeners) {
+            listener.onNewPulse(currentPulse)
+        }
+    }
+
+    private fun append(brightness: Float, timestamp: Float) {
+        brightnessHistory.push(brightness)
+        timestampHistory.push(timestamp)
     }
 
     private fun computeMeanValue(array: ShortArray): Float {
         return array.map { it.toLong() }.sum() / array.size.toFloat()
     }
 
-    private fun computeMeanDifference(array1: ShortArray, array2: ShortArray): Float {
-        if (array1.size != array2.size) {
-            throw ArrayStoreException("Arrays have different sizes and cannot be diffed!")
-        }
-        val totalDiff: Long = (0 until array1.size)
-                .map { abs(array1[it].toLong() - array2[it].toLong()) }
-                .sum()
-        return totalDiff / array1.size.toFloat()
-    }
-
     private fun computeFrequency(): Float {
-        val brightnessFFT = DoubleArray(HISTORY_BUFFER_SIZE)
-        (0 until HISTORY_BUFFER_SIZE).map { brightnessFFT[it] = brightnessHistory[it].toDouble() }
-        fourier.fft(brightnessFFT, zeros)
-        (0 until HISTORY_BUFFER_SIZE).map { brightnessFFT[it] = 2.0/ HISTORY_BUFFER_SIZE * sqrt(brightnessFFT[it] * brightnessFFT[it] + zeros[it] * zeros[it]) }
-        zeros.map { 0 }
-        var max = 0.0
-        var argmax = 0
-        for (i in 1 until HISTORY_BUFFER_SIZE / 2) {
-            if (brightnessFFT[i] > max) {
-                max = brightnessFFT[i]
-                argmax = i
-            }
+        val r = (0 until HISTORY_BUFFER_SIZE).map { timestampHistory[it] to brightnessHistory[it] }.simpleRegression()
+        Log.d(loggingTag, "Regression complete.  Parameters b=${r.intercept}, m=${r.slope}")
+        val meanInterval = timestampHistory.averageGap()
+        val totalMinInSegment = meanInterval * HISTORY_BUFFER_SIZE / 60
+        Log.d(loggingTag, "Mean interval computed as $meanInterval s for total history length of $totalMinInSegment min")
+
+        var bpPeaks = (0 until brightnessHistory.size).map{
+              if(timestampHistory[it]*r.slope+r.intercept > brightnessHistory[it]){
+                  0
+              } else brightnessHistory[it]
         }
-        val sb = StringBuilder()
-        for (i in brightnessFFT) {
-            sb.append(i.toString())
-            sb.append(", ")
-        }
-        Log.d(loggingTag, "FFTBuf: " + sb.toString())
-        val meanInterval = averageDistance(timestampHistory) / 1e9;
-        Log.d(loggingTag, "Mean interval computed as $meanInterval")
-        val bpm = argmax * HISTORY_BUFFER_SIZE * meanInterval.toFloat()
-        Log.d(loggingTag, "FFT-derived freq $bpm bpm")
-        return bpm
+        brightnessHistory.localMaximaIndices().map { timestampHistory[it] }
+
+        val numIntersects = (0 until HISTORY_BUFFER_SIZE - 1).map {
+            if (doesIntersect(timestampHistory[it], brightnessHistory[it], timestampHistory[it + 1], brightnessHistory[it + 1], r.slope.toFloat(), r.intercept.toFloat())) 1 else 0
+        }.sum()
+        val bpm = numIntersects / 2 / totalMinInSegment
+        Log.d(loggingTag, "Trendline intersect freq $bpm bpm")
+        return bpm.toFloat()
     }
 
     private fun convertByteBufferToShortArray(buffer: ByteBuffer): ShortArray {
         val redByteBuffer = ByteArray(buffer.capacity(), { _ -> 0.toByte() })
         buffer.get(redByteBuffer)
         return ShortArray(redByteBuffer.size, { i -> redByteBuffer[i].toShort() })
+    }
+
+    private fun printArray(arrayName: String, array: RingFloatArray) {
+        val sb = StringBuilder()
+        for (i in array) {
+            sb.append(i.toString())
+            sb.append(", ")
+        }
+        Log.d(loggingTag, "$arrayName: " + sb.toString())
+    }
+
+    private fun nsToS(ns: Long): Float {
+        return (ns / 1e9).toFloat()
     }
 
     class CameraNotFoundException(message: String?) : Exception(message)
@@ -206,7 +222,7 @@ class PulseProvider(private val context: Context) {
     }
 
     interface HeartbeatListener {
-        fun onHeartbeat(timestamp: Long, brightness: Float)
+        fun onHeartbeat(timestamp: Float, brightness: Float)
         fun onNewPulse(pulse: Float)
     }
 }

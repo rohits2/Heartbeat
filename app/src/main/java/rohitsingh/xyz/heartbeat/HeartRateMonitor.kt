@@ -1,35 +1,31 @@
 package rohitsingh.xyz.heartbeat
 
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.support.v7.app.AppCompatActivity
 import android.os.Bundle
-import android.provider.ContactsContract
-import android.util.Log
 import android.widget.TextView
 import android.widget.Toast
 import com.jjoe64.graphview.GraphView
 import com.jjoe64.graphview.GridLabelRenderer
 import com.jjoe64.graphview.series.DataPoint
 import com.jjoe64.graphview.series.LineGraphSeries
-import java.io.DataOutput
 
 const val MAX_DATA_POINTS = 1024
 const val CAMERA_REQUEST_CODE = 1021 // literally no reason for this choice
-
+const val SMOOTHING_FACTOR = 0.7f
 class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
-
-
-
     private val loggingTag: String = "HeartRateMonitor"
 
     private lateinit var provider: PulseProvider
 
     private val graph by lazy { findViewById<GraphView>(R.id.graph) }
     private val pulseView by lazy {findViewById<TextView>(R.id.pulse)}
+    private val pulseError by lazy {findViewById<TextView>(R.id.pulseError)}
     private val mmHg = LineGraphSeries<DataPoint>()
     private var movingAverage = 0f
-    private val SMOOTHING_FACTOR = 0.7f;
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_heart_rate_monitor)
@@ -44,7 +40,7 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
 
     override fun onResume() {
         super.onResume()
-        provider.restart()
+        provider.resume()
     }
 
     private fun setupGraphing() {
@@ -57,18 +53,21 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
         graph.gridLabelRenderer.isVerticalLabelsVisible = false
         graph.gridLabelRenderer.isHorizontalLabelsVisible = false
         mmHg.color = Color.RED
-        mmHg.thickness = 30
+        mmHg.isDrawBackground = true
+        mmHg.backgroundColor = 0xFFCCCC
+        mmHg.thickness = 10
         provider.addHeartbeatListener(this)
     }
 
+    @SuppressLint("SetTextI18n")
     override fun onNewPulse(pulse: Float) {
         pulseView.text = pulse.toInt().toString()
+        pulseError.text = "±${provider.pulseError.toInt()}"
     }
 
-    override fun onHeartbeat(timestamp: Long, brightness: Float) {
-        val timestampSecs = timestamp.toDouble() / 1e9
+    override fun onHeartbeat(timestamp: Float, brightness: Float) {
         movingAverage = weightedAverage(movingAverage, brightness, SMOOTHING_FACTOR)
-        mmHg.appendData(DataPoint(timestampSecs, movingAverage.toDouble()), true, MAX_DATA_POINTS)
+        mmHg.appendData(DataPoint(timestamp.toDouble(), movingAverage.toDouble()), true, MAX_DATA_POINTS)
     }
 
     private fun setupPermissions() {
