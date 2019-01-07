@@ -30,13 +30,13 @@ const val MAX_IMAGES = 4 //The maximum length of the ImageReader queue.
 const val HISTORY_BUFFER_SIZE = 200 //The size of the buffers storing brightness and timestamp.
 const val EVENT_TRIGGER = 32 // The number of samples before a pulse update is triggered
 const val PRELOAD_THRESHOLD = 30 // The number of samples to discard while the camera powers on
-const val FRAME_WIDTH = 240
-const val FRAME_HEIGHT = 120
+const val FRAME_WIDTH = 30
+const val FRAME_HEIGHT = 30
 
 const val HZ = 1 / 60f   //This converts from hertz to the timestamp units (seconds, in this case)
-const val LOW_CUTOFF_FREQ = 30 * HZ
-const val HIGH_CUTOFF_FREQ = 240 * HZ
-const val PULSE_SAMPLES_REQUIRED = 3
+const val LOW_CUTOFF_FREQ = 30 * HZ // Frequencies lower than this will be ignored
+const val HIGH_CUTOFF_FREQ = 240 * HZ // Frequencies higher than this will not be calculated.
+const val PULSE_SAMPLES_REQUIRED = 3 // Min number of pulse samples required before reporting a pulse
 const val DEVIANCE_BIAS = 10 // This is added to the standard deviation to artificially increase it
 
 class PulseProvider(private val context: Context, private var cameraView: ImageView) {
@@ -73,22 +73,18 @@ class PulseProvider(private val context: Context, private var cameraView: ImageV
     val pulse get() = currentPulse
     val pulseError get() = (DEVIANCE_BIAS + pulses.standardDeviation()) / sqrt(pulses.size.toDouble())
 
-    fun addHeartbeatListener(listener: HeartbeatListener) {
-        beatListeners.add(listener)
+
+    /**
+     * Called when the provider is no longer needed. Same as pause.
+     */
+    fun end() {
+        pause()
     }
 
-    fun removeHeartbeatListener(listener: HeartbeatListener): Boolean {
-        return beatListeners.remove(listener)
-    }
-
-    fun end(){
-        if (holdsOpenCamera) {
-            holdsOpenCamera = false
-            camera.close()
-        }
-        pulses.clear()
-    }
-
+    /**
+     * Called when the provider needs to suspend (screen off, app switch, etc.)
+     * Turns off the flash, resets the pulse counts, and releases the camera.
+     */
     fun pause() {
         if (holdsOpenCamera) {
             holdsOpenCamera = false
@@ -97,6 +93,10 @@ class PulseProvider(private val context: Context, private var cameraView: ImageV
         pulses.clear()
     }
 
+    /**
+     * Called when the provider needs to resume.
+     * Re-initializes the camera and re-sets the delay counters.
+     */
     fun resume() {
         if (!holdsOpenCamera) {
             holdsOpenCamera = true
@@ -105,6 +105,16 @@ class PulseProvider(private val context: Context, private var cameraView: ImageV
         }
     }
 
+    /**
+     * Opens a rear camera and configures it to write to the surface provided.
+     * Configures the following:
+     * - ISO 50
+     * - Exposure time 1/120s
+     * - White balance locked
+     * - Autofocus locked
+     * - Black level locked
+     * This routine then requests a callback to getFrame
+     */
     private fun openCamera(readerSurface: Surface) {
         val cameraManager: CameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         val rearCameraID = findRearCameraID(cameraManager)
@@ -139,6 +149,9 @@ class PulseProvider(private val context: Context, private var cameraView: ImageV
         }, null)
     }
 
+    /**
+     * Find the a camera ID of some rear camera.
+     */
     private fun findRearCameraID(cameraManager: CameraManager): String {
         for (camera in cameraManager.cameraIdList) {
             val characteristic = cameraManager.getCameraCharacteristics(camera)
@@ -149,13 +162,15 @@ class PulseProvider(private val context: Context, private var cameraView: ImageV
         throw CameraNotFoundException("No camera could be found!")
     }
 
+    /**
+     * Fetch a frame from the image buffer, then compute its brightness and compute pulse updates.
+     */
     private fun getFrame() {
         eventCounter++
         val image = reader.acquireLatestImage() ?: return
         val (redBuf, _, _) = image.planes
         val currentRedBuffer = convertByteBufferToShortArray(redBuf.buffer)
         var brightness = computeMeanValue(currentRedBuffer)
-        Log.d(loggingTag, "${brightness}")
         if (eventCounter % EVENT_TRIGGER == 0) {
             handlePulse()
         }
@@ -171,6 +186,9 @@ class PulseProvider(private val context: Context, private var cameraView: ImageV
         image.close()
     }
 
+    /**
+     * Compute pulse updates, and if necessary, broadcast them to listeners.
+     */
     private fun handlePulse() {
         if (!timestampHistory.hasBeenFilled) {
             Log.d(loggingTag, "Can't compute pulse because the timestamp buffer has not filled!")
@@ -187,15 +205,15 @@ class PulseProvider(private val context: Context, private var cameraView: ImageV
         }
     }
 
-    private fun append(brightness: Float, timestamp: Float) {
-        brightnessHistory.push(brightness)
-        timestampHistory.push(timestamp)
-    }
 
-    private fun computeMeanValue(array: ShortArray): Float {
-        return array.map { it.toLong() }.sum() / array.size.toFloat()
-    }
-
+    /**
+     * Using an FFT, compute the dominant frequency of the heartbeats.
+     * The steps are as follows:
+     * 1. Set up an FFT using an optimized solver.
+     * 2. Compute a zero-mean brightness buffer (so that there is no DC component to the signal).
+     * 3. Compute intervals and frequency ranges based on the timestamp buffer.
+     * 4. Iterate between the LOW_CUTOFF_FREQ and HIGH_CUTOFF_FREQ to find the freq with max power.
+     */
     private fun computeFrequency(): Float {
         val noise = Noise.real()
                 .optimized()
@@ -221,12 +239,28 @@ class PulseProvider(private val context: Context, private var cameraView: ImageV
         return maxF
     }
 
+    private fun append(brightness: Float, timestamp: Float) {
+        brightnessHistory.push(brightness)
+        timestampHistory.push(timestamp)
+    }
+
+    private fun computeMeanValue(array: ShortArray): Float {
+        return array.map { it.toLong() }.sum() / array.size.toFloat()
+    }
+
     private fun convertByteBufferToShortArray(buffer: ByteBuffer): ShortArray {
         val redByteBuffer = ByteArray(buffer.capacity(), { _ -> 0.toByte() })
         buffer.get(redByteBuffer)
         return ShortArray(redByteBuffer.size, { i -> redByteBuffer[i].toShort() })
     }
 
+    fun addHeartbeatListener(listener: HeartbeatListener) {
+        beatListeners.add(listener)
+    }
+
+    fun removeHeartbeatListener(listener: HeartbeatListener): Boolean {
+        return beatListeners.remove(listener)
+    }
 
     private fun printArray(arrayName: String, array: RingFloatArray) {
         val sb = StringBuilder()
@@ -258,7 +292,8 @@ class PulseProvider(private val context: Context, private var cameraView: ImageV
         }
 
         override fun onConfigured(nullableCaptureSession: CameraCaptureSession?) {
-            val captureSession: CameraCaptureSession = nullableCaptureSession ?: throw CameraNotOpenableException("Camera could not be configured (was null).")
+            val captureSession: CameraCaptureSession = nullableCaptureSession
+                    ?: throw CameraNotOpenableException("Camera could not be configured (was null).")
             captureSession.setRepeatingRequest(captureRequest, null, handler)
         }
 

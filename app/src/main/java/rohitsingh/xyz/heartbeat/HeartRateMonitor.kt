@@ -42,6 +42,7 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
     override fun onPause() {
         super.onPause()
         provider.pause()
+        mmHg.resetData(arrayOf())
     }
 
     override fun onResume() {
@@ -76,6 +77,9 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
     }
 
     override fun onHeartbeat(timestamp: Float, brightness: Float) {
+        if (movingAverage == 0f) {
+            movingAverage = brightness
+        }
         movingAverage = weightedAverage(movingAverage, brightness, SMOOTHING_FACTOR)
         mmHg.appendData(DataPoint(timestamp.toDouble(), movingAverage.toDouble()), true, MAX_DATA_POINTS)
     }

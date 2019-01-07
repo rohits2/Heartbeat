@@ -1,5 +1,8 @@
 package rohitsingh.xyz.heartbeat
 
+import kotlin.math.max
+import kotlin.math.min
+
 /**
  * Created by rohit on 12/27/17.
  */
@@ -39,14 +42,17 @@ class RingFloatArray(val size: Int) : Iterable<Float> {
 
     fun getZeroedArray(): FloatArray {
         val arr = FloatArray(size)
-        var sum = 0f
+        var max = 0f
+        var min = 0f
         for (i in 0 until size) {
             arr[i] = this[i]
-            sum += this[i]
+            max = max(max, this[i])
+            min = min(min, this[i])
         }
-        val avg = sum / size
         for (i in 0 until size) {
-            arr[i] -= avg
+            arr[i] -= min
+            arr[i] *= 2 * (max - min)
+            arr[i] -= 1f
         }
         return arr
     }
