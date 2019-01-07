@@ -6,14 +6,16 @@ import android.graphics.ImageFormat
 import android.hardware.camera2.*
 import android.media.ImageReader
 import android.os.Handler
+import android.support.v8.renderscript.RenderScript
 import android.util.Log
 import android.view.Surface
+import android.widget.ImageView
 import android.widget.Toast
-import org.nield.kotlinstatistics.simpleRegression
-import org.nield.kotlinstatistics.standardDeviation
-import java.nio.ByteBuffer
 import com.paramsen.noise.Noise
+import org.nield.kotlinstatistics.median
+import org.nield.kotlinstatistics.standardDeviation
 import java.lang.Math.*
+import java.nio.ByteBuffer
 
 
 /**
@@ -25,21 +27,19 @@ import java.lang.Math.*
  * Created by rohit on 9/4/17.
  */
 const val MAX_IMAGES = 4 //The maximum length of the ImageReader queue.
-const val HISTORY_BUFFER_SIZE = 256 //The size of the buffers storing brightness and timestamp.
+const val HISTORY_BUFFER_SIZE = 200 //The size of the buffers storing brightness and timestamp.
 const val EVENT_TRIGGER = 32 // The number of samples before a pulse update is triggered
-const val FRAME_WIDTH = 480
-const val FRAME_HEIGHT = 240
-
-const val TRENDLINE_INERTIA = 0.99f
-const val LOW_PASS_INERTIA = 0.7f
-const val ESTIMATED_MAGNITUDE = 70f //This is used to make the moving-average adjuster converge quickly.
+const val PRELOAD_THRESHOLD = 30 // The number of samples to discard while the camera powers on
+const val FRAME_WIDTH = 240
+const val FRAME_HEIGHT = 120
 
 const val HZ = 1 / 60f   //This converts from hertz to the timestamp units (seconds, in this case)
 const val LOW_CUTOFF_FREQ = 30 * HZ
 const val HIGH_CUTOFF_FREQ = 240 * HZ
-const val SAMPLE_SIZE_REQUIRED = 8
+const val PULSE_SAMPLES_REQUIRED = 3
+const val DEVIANCE_BIAS = 10 // This is added to the standard deviation to artificially increase it
 
-class PulseProvider(private val context: Context) {
+class PulseProvider(private val context: Context, private var cameraView: ImageView) {
     // Globals for camera capture
     private lateinit var camera: CameraDevice
     private val reader = ImageReader.newInstance(FRAME_WIDTH, FRAME_HEIGHT, ImageFormat.YUV_420_888, MAX_IMAGES)
@@ -55,23 +55,23 @@ class PulseProvider(private val context: Context) {
     private val timestampHistory = RingFloatArray(HISTORY_BUFFER_SIZE)
 
     // Interface variables
-    private var eventCounter = 0
+    private val bitmapper by lazy { ImageConverter(context) }
+    private var eventCounter = -PRELOAD_THRESHOLD
     private var currentPulse: Float = 0f
     private var beatListeners = ArrayList<HeartbeatListener>()
 
     // Variables for signal extraction
-    private var trendlineAvg = ESTIMATED_MAGNITUDE
-    private var lowPassAvg = 0f
     private var pulses = ArrayList<Float>()
 
     init {
         holdsOpenCamera = true
+        val rs = RenderScript.create(context)
         openCamera(reader.surface)
         reader.setOnImageAvailableListener({ getFrame() }, null)
     }
 
     val pulse get() = currentPulse
-    val pulseError get() = pulses.standardDeviation()/sqrt(pulses.size.toDouble())
+    val pulseError get() = (DEVIANCE_BIAS + pulses.standardDeviation()) / sqrt(pulses.size.toDouble())
 
     fun addHeartbeatListener(listener: HeartbeatListener) {
         beatListeners.add(listener)
@@ -94,12 +94,14 @@ class PulseProvider(private val context: Context) {
             holdsOpenCamera = false
             camera.close()
         }
+        pulses.clear()
     }
 
     fun resume() {
         if (!holdsOpenCamera) {
             holdsOpenCamera = true
             openCamera(reader.surface)
+            eventCounter = -PRELOAD_THRESHOLD
         }
     }
 
@@ -121,6 +123,11 @@ class PulseProvider(private val context: Context) {
                 captureBuilder.addTarget(readerSurface)
                 captureBuilder.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
                 captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                captureBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, 8333333L)
+                captureBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, 50)
+                captureBuilder.set(CaptureRequest.BLACK_LEVEL_LOCK, true)
+                captureBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true)
+                captureBuilder.set(CaptureRequest.CONTROL_AWB_LOCK, true)
 
                 camera.createCaptureSession(listOf(readerSurface), CameraSessionCallback(captureBuilder.build()), handler)
                 Log.d(loggingTag, "Acquired camera!")
@@ -143,36 +150,39 @@ class PulseProvider(private val context: Context) {
     }
 
     private fun getFrame() {
-        eventCounter++;
+        eventCounter++
         val image = reader.acquireLatestImage() ?: return
         val (redBuf, _, _) = image.planes
         val currentRedBuffer = convertByteBufferToShortArray(redBuf.buffer)
         var brightness = computeMeanValue(currentRedBuffer)
+        Log.d(loggingTag, "${brightness}")
         if (eventCounter % EVENT_TRIGGER == 0) {
             handlePulse()
         }
-        trendlineAvg = weightedAverage(trendlineAvg, brightness, TRENDLINE_INERTIA)
-        brightness -= trendlineAvg
-        lowPassAvg = weightedAverage(lowPassAvg, brightness, LOW_PASS_INERTIA)
-        if (timestampHistory[0] == 0f) {
-            timestampHistory[0] = nsToS(image.timestamp)
-        }
-        append(lowPassAvg, nsToS(image.timestamp) - startTime)
-        for (listener in beatListeners) {
-            listener.onHeartbeat(nsToS(image.timestamp) - startTime, brightness) // Offset image timestamp by start time to get more reasonable numbers
+        if (eventCounter > 0) {
+            if (timestampHistory[0] == 0f) {
+                timestampHistory[0] = nsToS(image.timestamp)
+            }
+            append(brightness, nsToS(image.timestamp) - startTime)
+            for (listener in beatListeners) {
+                listener.onHeartbeat(nsToS(image.timestamp) - startTime, brightness) // Offset image timestamp by start time to get more reasonable numbers
+            }
         }
         image.close()
     }
 
     private fun handlePulse() {
-        //printArray("BrightnessHistory", brightnessHistory)
-        //printArray("TimestampHistory", timestampHistory)
+        if (!timestampHistory.hasBeenFilled) {
+            Log.d(loggingTag, "Can't compute pulse because the timestamp buffer has not filled!")
+            return
+        }
+        Log.d(loggingTag, "Computing pulse...")
         pulses.add(computeFrequency())
-        if (pulses.size > SAMPLE_SIZE_REQUIRED) {
-            pulses.removeAt(0)
-            currentPulse = pulses.average().toFloat()
+        if (pulses.size > PULSE_SAMPLES_REQUIRED) {
+            currentPulse = pulses.median().toFloat()
             for (listener in beatListeners) {
                 listener.onNewPulse(currentPulse)
+                Log.d(loggingTag, "Pushing to listener!")
             }
         }
     }
@@ -190,7 +200,7 @@ class PulseProvider(private val context: Context) {
         val noise = Noise.real()
                 .optimized()
                 .init(HISTORY_BUFFER_SIZE, true) //input size == 4096, internal output array
-        val complexFft = noise.fft(brightnessHistory.getBackingArray())
+        val complexFft = noise.fft(brightnessHistory.getZeroedArray())
         val realFft = FloatArray(HISTORY_BUFFER_SIZE / 2)
         for (i in 0 until HISTORY_BUFFER_SIZE / 2 - 1) {
             realFft[i] = complexFft[2 * i] * complexFft[2 * i] + complexFft[2 * i + 1] * complexFft[2 * i + 1]
@@ -200,7 +210,7 @@ class PulseProvider(private val context: Context) {
         val lowCut: Int = floor(LOW_CUTOFF_FREQ * HISTORY_BUFFER_SIZE * interval).toInt()
         val highCut: Int = ceil(HIGH_CUTOFF_FREQ * HISTORY_BUFFER_SIZE * interval).toInt()
         var maxA = 0f
-        var maxF = 20f
+        var maxF = LOW_CUTOFF_FREQ
         for (i in lowCut until highCut) {
             if (realFft[i] > maxA) {
                 maxA = realFft[i]
@@ -216,6 +226,7 @@ class PulseProvider(private val context: Context) {
         buffer.get(redByteBuffer)
         return ShortArray(redByteBuffer.size, { i -> redByteBuffer[i].toShort() })
     }
+
 
     private fun printArray(arrayName: String, array: RingFloatArray) {
         val sb = StringBuilder()

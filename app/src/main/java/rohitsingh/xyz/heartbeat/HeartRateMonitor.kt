@@ -3,9 +3,10 @@ package rohitsingh.xyz.heartbeat
 import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.support.v7.app.AppCompatActivity
 import android.os.Bundle
+import android.support.v7.app.AppCompatActivity
 import android.view.View
+import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
@@ -17,15 +18,17 @@ import com.jjoe64.graphview.series.LineGraphSeries
 const val MAX_DATA_POINTS = 1024
 const val CAMERA_REQUEST_CODE = 1021 // literally no reason for this choice
 const val SMOOTHING_FACTOR = 0.7f
+
 class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
     private val loggingTag: String = "HeartRateMonitor"
 
     private lateinit var provider: PulseProvider
 
     private val graph by lazy { findViewById<GraphView>(R.id.graph) }
-    private val pulseView by lazy {findViewById<TextView>(R.id.pulse)}
-    private val pulseError by lazy {findViewById<TextView>(R.id.pulseError)}
-    private val progressCircle by lazy {findViewById<ProgressBar>(R.id.progressBar)}
+    private val pulseView by lazy { findViewById<TextView>(R.id.pulse) }
+    private val pulseError by lazy { findViewById<TextView>(R.id.pulseError) }
+    private val progressCircle by lazy { findViewById<ProgressBar>(R.id.progressBar) }
+    private val cameraView by lazy { findViewById<ImageView>(R.id.imageView) }
     private val mmHg = LineGraphSeries<DataPoint>()
     private var movingAverage = 0f
 
@@ -64,9 +67,9 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
 
     @SuppressLint("SetTextI18n")
     override fun onNewPulse(pulse: Float) {
-        pulseView.text = pulse.toInt().toString()
+        pulseView.text = "${pulse.toInt()} bpm"
         pulseError.text = "±${provider.pulseError.toInt()}"
-        if (provider.pulseError < 5){
+        if (provider.pulseError < 2) {
             provider.pause()
             progressCircle.visibility = View.INVISIBLE
         }
@@ -78,9 +81,9 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
     }
 
     private fun setupPermissions() {
-        val permissionCheck = checkSelfPermission(android.Manifest.permission.CAMERA);
+        val permissionCheck = checkSelfPermission(android.Manifest.permission.CAMERA)
         if (permissionCheck == PackageManager.PERMISSION_GRANTED) {
-            provider = PulseProvider(this)
+            provider = PulseProvider(this, cameraView)
         } else {
             requestPermissions(arrayOf(android.Manifest.permission.CAMERA), CAMERA_REQUEST_CODE)
         }
@@ -91,9 +94,10 @@ class HeartRateMonitor : AppCompatActivity(), PulseProvider.HeartbeatListener {
         // Ensure the request code is one sent from the camera permission
         if (requestCode == CAMERA_REQUEST_CODE) {
             if (grantResults.contains(PackageManager.PERMISSION_GRANTED)) {
-                provider = PulseProvider(this)
+                provider = PulseProvider(this, cameraView)
             } else {
                 Toast.makeText(this, "The app needs your camera to watch your pulse!", Toast.LENGTH_LONG).show()
+                setupPermissions()
             }
         }
     }
